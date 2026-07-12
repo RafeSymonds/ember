@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# ember — main entry point. Usage: bin/ember <subcommand> [args]
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+usage() {
+  cat <<'EOF'
+usage: bin/ember <subcommand> [args]
+
+  train [args]   train a model         (python -m ember.train)
+  test  [args]   run the test suite    (pytest tests/)
+  eval  [args]   run evals             (arrives in A2)
+EOF
+}
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  train) exec python -m ember.train "$@" ;;
+  test)  exec python -m pytest tests/ "$@" ;;
+  eval)  echo "ember eval: arrives in milestone A2." >&2; exit 1 ;;
+  help|-h|--help) usage ;;
+  *) echo "unknown subcommand: $cmd" >&2; usage; exit 1 ;;
+esac
