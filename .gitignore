@@ -6,6 +6,7 @@ __pycache__/
 /data/
 /checkpoints/
 /runs/
+/baselines/
 wandb/
 *.pt
 .DS_Store

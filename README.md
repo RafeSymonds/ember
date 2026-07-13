@@ -25,17 +25,25 @@ bin/ember test          # runs the suite (the A0 gate test skips until you write
 ## Entry points
 
 ```
-bin/ember train [args]   # training (python -m ember.train)
-bin/ember test  [args]   # test suite (pytest tests/)
-bin/ember eval  [args]   # arrives in A2
+bin/ember train    [args]   # training (python -m ember.train)
+bin/ember test     [args]   # test suite (pytest tests/)
+bin/ember data     [name]   # fetch datasets into data/ (default: shakespeare)
+bin/ember baseline [args]   # nanoGPT A0 baseline (--prepare-only to stage it)
+bin/ember compare  [args]   # score your run vs the baseline (2% bar)
+bin/ember env               # device/precision/speed report for this machine
+bin/ember eval     [args]   # arrives in A2
 ```
+
+`bin/ember` automatically uses `.venv/` if present — no activate needed.
 
 ## Layout
 
 ```
 ember/            the library: model.py, data.py, train.py (stubs carry the spec)
 tests/            starts with the A0 overfit gate test — written FIRST
+tools/            infra, not learning material: data fetch, baseline, scoring
 docs/milestones/  one brief per milestone: spec, learning kit, definition of done
+experiments/      leaderboard (empty until A4)
 NOTES.md          lab notebook: hypotheses, dead ends, numbers, open questions
 ```
 

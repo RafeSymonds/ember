@@ -3,13 +3,22 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# prefer the repo venv when not already inside one
+if [ -z "${VIRTUAL_ENV:-}" ] && [ -x .venv/bin/python3 ]; then
+  PATH="$(pwd)/.venv/bin:$PATH"
+fi
+
 usage() {
   cat <<'EOF'
 usage: bin/ember <subcommand> [args]
 
-  train [args]   train a model         (python -m ember.train)
-  test  [args]   run the test suite    (pytest tests/)
-  eval  [args]   run evals             (arrives in A2)
+  train    [args]   train a model                  (python -m ember.train)
+  test     [args]   run the test suite             (pytest tests/)
+  data     [name]   fetch datasets into data/      (default: shakespeare)
+  baseline [args]   nanoGPT A0 baseline run        (--prepare-only to stage it)
+  compare  [args]   score a run vs the baseline    (applies the 2% bar)
+  env               device/precision/speed report for this machine
+  eval     [args]   run evals                      (arrives in A2)
 EOF
 }
 
@@ -17,9 +26,13 @@ cmd="${1:-help}"
 [ $# -gt 0 ] && shift
 
 case "$cmd" in
-  train) exec python -m ember.train "$@" ;;
-  test)  exec python -m pytest tests/ "$@" ;;
-  eval)  echo "ember eval: arrives in milestone A2." >&2; exit 1 ;;
+  train)    exec python3 -m ember.train "$@" ;;
+  test)     exec python3 -m pytest tests/ "$@" ;;
+  data)     exec python3 tools/get_data.py "$@" ;;
+  baseline) exec bash tools/baseline.sh "$@" ;;
+  compare)  exec python3 tools/compare_a0.py "$@" ;;
+  env)      exec python3 tools/env_check.py "$@" ;;
+  eval)     echo "ember eval: arrives in milestone A2." >&2; exit 1 ;;
   help|-h|--help) usage ;;
   *) echo "unknown subcommand: $cmd" >&2; usage; exit 1 ;;
 esac
