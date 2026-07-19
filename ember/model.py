@@ -43,7 +43,7 @@ class Head(nn.Module):
         # x: (B, T, C)   B sequences, T positions, C = n_embd channels each
         B, T, C = x.shape
         Q = self.query(x)  # (B, T, head_size)  each position: "what am I looking for?"
-        K = self.key(x)    # (B, T, head_size)  each position: "what do I contain?"
+        K = self.key(x)  # (B, T, head_size)  each position: "what do I contain?"
 
         # scores: every query position vs every key position.
         # (B, T, hs) @ (B, hs, T) -> (B, T, T)
@@ -62,6 +62,24 @@ class Head(nn.Module):
         # each position's output = weighted average of the values it attends to:
         # (B, T, T) @ (B, T, hs) -> (B, T, head_size)
         return wei @ V
+
+
+class MultiHead(nn.Module):
+    def __init__(
+        self,
+        n_head: int,
+        n_embd: int,
+        head_size: int,
+        block_size: int,
+    ) -> None:
+        super().__init__()
+
+        self.heads = nn.ModuleList(
+            Head(n_embd, head_size, block_size) for _ in range(n_head)
+        )
+
+    def forward(self, x):
+        return torch.cat(list(head(x) for head in self.heads), dim=-1)
 
 
 class GPT(nn.Module):
@@ -113,7 +131,12 @@ class GPT(nn.Module):
         # one row per position slot, so the table is block_size deep
         self.position_embedding_layer = nn.Embedding(block_size, n_embd)
         # rung (b): one full-width head; rung (c) splits into n_head of n_embd // n_head
-        self.sa_head = Head(n_embd, head_size=n_embd, block_size=block_size)
+        self.sa_head = MultiHead(
+            n_head=n_head,
+            n_embd=n_embd,
+            head_size=n_embd // n_head,
+            block_size=block_size,
+        )
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
