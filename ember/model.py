@@ -20,3 +20,9 @@ timebox). nanoGPT source is for diffing AFTER yours trains, never before.
 """
 
 # Your code here.
+
+from torch import nn
+
+
+class GPT(nn.Module):
+    pass
