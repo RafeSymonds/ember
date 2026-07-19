@@ -65,6 +65,34 @@ class Head(nn.Module):
 
 
 class GPT(nn.Module):
+    """Decoder-only transformer, built rung by rung (see module docstring).
+
+    Constructor args are ARCHITECTURE; batch size B and sequence length T are
+    runtime choices — the model accepts any T <= block_size.
+
+    vocab_size: how many distinct symbols exist. A fact about the data, not a
+        tuning knob: sets the token table's rows and the logits' width.
+        (65 for char-level shakespeare; ~50k once BPE arrives in A1.)
+    block_size: the context window — the farthest back attention can EVER see.
+        Sets the position table's rows and the causal mask's size. Attention
+        builds a T x T score matrix, so this is the quadratically expensive knob.
+    n_layer:    depth — how many blocks stack at rung (e). Each block re-mixes
+        and refines what the previous one produced. (Unused before rung (e).)
+    n_head:     how many parallel attention conversations per layer, from rung
+        (c). Each gets head_size = n_embd // n_head dims; outputs concatenate
+        back to exactly n_embd. Hard constraint: n_embd % n_head == 0.
+    n_embd:     the working width (the C in every shape comment) — every token
+        becomes a vector this wide at the embedding border and stays that wide
+        through the trunk. The primary capacity knob.
+
+    head_size is deliberately NOT an arg — it's always derived (n_embd // n_head;
+    full n_embd for rung (b)'s single head). It's the width the Q.K dot product
+    sums over, hence Head's 1/sqrt(head_size) scale.
+
+    Reference points: GPT-2 124M is block_size 1024, n_layer 12, n_head 12,
+    n_embd 768 — same skeleton, bigger numbers.
+    """
+
     def __init__(
         self,
         vocab_size: int,
