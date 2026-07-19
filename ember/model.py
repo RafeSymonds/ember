@@ -22,10 +22,12 @@ timebox). nanoGPT source is for diffing AFTER yours trains, never before.
 # Your code here.
 
 import torch
-from torch import blackman_window, embedding, ne, nn
+from torch import nn
 
 from torch.nn import functional as F
 
+# training-time regularization: every Dropout layer zeroes this fraction of its
+# inputs during .train() and does nothing during .eval()
 DROPOUT = 0.2
 
 
@@ -62,6 +64,8 @@ class Head(nn.Module):
         # normalize each row i over its allowed keys j <= i: rows now sum to 1
         wei = F.softmax(wei, dim=-1)
 
+        # randomly silence some attention links (train only): the model can't
+        # lean on any single query->key connection to carry the answer
         wei = self.dropout(wei)
 
         V = self.value(x)  # (B, T, head_size)  what each position actually broadcasts
@@ -83,28 +87,40 @@ class MultiHead(nn.Module):
         self.heads = nn.ModuleList(
             Head(n_embd, head_size, block_size) for _ in range(n_head)
         )
+        # W^O, the synthesis step: after concat, every output channel can draw on
+        # ALL heads' findings — and it decides how attention writes into the
+        # residual stream. Without it each head owns a fixed slice forever.
+        self.proj = nn.Linear(head_size * n_head, n_embd)
         self.dropout = nn.Dropout(DROPOUT)
 
     def forward(self, x):
+        # each head reports in its own head_size-wide slice: (B, T, n_head * hs)
         out = torch.cat(list(head(x) for head in self.heads), dim=-1)
+        out = self.proj(out)  # (B, T, C) — synthesized across heads
         out = self.dropout(out)
 
         return out
 
 
-class FeedFoward(nn.Module):
+class FeedForward(nn.Module):
+    """The per-token computation stage: attention gathers, this digests.
+
+    Applied at every position independently — no cross-token communication
+    happens here; that's attention's job.
+    """
+
     def __init__(self, n_embd: int) -> None:
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
+            nn.Linear(n_embd, 4 * n_embd),  # widen: room to compute (GPT's 4x convention)
+            nn.ReLU(),  # the nonlinearity that makes stacking layers mean anything
+            nn.Linear(4 * n_embd, n_embd),  # narrow back to the stream width C
             nn.Dropout(DROPOUT),
         )
 
     def forward(self, x):
-        return self.net(x)
+        return self.net(x)  # (B, T, C) -> (B, T, C)
 
 
 class Block(nn.Module):
@@ -116,13 +132,19 @@ class Block(nn.Module):
         self.sa = MultiHead(
             n_head=n_head, n_embd=n_embd, head_size=head_size, block_size=block_size
         )
-        self.ffwd = FeedFoward(n_embd=n_embd)
+        self.ffwd = FeedForward(n_embd=n_embd)
+        # pre-norm: each sublayer READS a normalized view of the stream; the
+        # stream itself is never normalized in place (that's what keeps the
+        # residual path clean)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
+        # the residual stream: sublayers ADD their contributions to x rather
+        # than replacing it. Gradients flow backward through the bare `+`
+        # untouched — this is the trick that makes deep stacks trainable.
+        x = x + self.sa(self.ln1(x))  # communicate: mix info across positions
+        x = x + self.ffwd(self.ln2(x))  # compute: digest it per position
 
         return x
 
@@ -139,8 +161,8 @@ class GPT(nn.Module):
     block_size: the context window — the farthest back attention can EVER see.
         Sets the position table's rows and the causal mask's size. Attention
         builds a T x T score matrix, so this is the quadratically expensive knob.
-    n_layer:    depth — how many blocks stack at rung (e). Each block re-mixes
-        and refines what the previous one produced. (Unused before rung (e).)
+    n_layer:    depth — how many Blocks stack in sequence. Each block re-mixes
+        (attention) and re-digests (MLP) what the previous one produced.
     n_head:     how many parallel attention conversations per layer, from rung
         (c). Each gets head_size = n_embd // n_head dims; outputs concatenate
         back to exactly n_embd. Hard constraint: n_embd % n_head == 0.
@@ -163,7 +185,6 @@ class GPT(nn.Module):
         n_layer: int,
         n_head: int,
         n_embd: int,
-        n_blocks: int,
     ) -> None:
         super().__init__()
 
@@ -178,22 +199,25 @@ class GPT(nn.Module):
         self.token_embedding_layer = nn.Embedding(vocab_size, n_embd)
         # one row per position slot, so the table is block_size deep
         self.position_embedding_layer = nn.Embedding(block_size, n_embd)
-        # rung (b): one full-width head; rung (c) splits into n_head of n_embd // n_head
 
+        # the trunk: n_layer identical Blocks run in sequence, each reading the
+        # stream the previous one wrote (n_layer IS the block count — one name,
+        # one knob)
         self.blocks = nn.Sequential(
-            *list(
-                (
-                    Block(
-                        n_head=n_head,
-                        n_embd=n_embd,
-                        head_size=head_size,
-                        block_size=block_size,
-                    )
+            *[
+                Block(
+                    n_head=n_head,
+                    n_embd=n_embd,
+                    head_size=head_size,
+                    block_size=block_size,
                 )
-                for _ in range(n_blocks)
-            )
+                for _ in range(n_layer)
+            ]
         )
 
+        # final norm: pre-norm blocks let the stream's magnitude drift as every
+        # block adds into it; re-standardize once before the only exit to logits
+        self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -216,7 +240,8 @@ class GPT(nn.Module):
         # (B, T, C) + (T, C): broadcasting copies the position rows across B.
         # after this, a token's vector encodes WHAT it is and WHERE it sits.
         x = token_embedding + pos_embedding
-        x = self.blocks(x)  # (B, T, C) -> (B, T, C), contents now context-mixed
+        x = self.blocks(x)  # (B, T, C) -> (B, T, C): n_layer rounds of mix-and-digest
+        x = self.ln_f(x)  # re-standardize the stream before scoring
 
         # the only exit from model-space: (B, T, C) -> (B, T, vocab_size)
         logits = self.lm_head(x)
@@ -267,14 +292,20 @@ if __name__ == "__main__":
 
     BATCH_SIZE = 64
     BLOCK_SIZE = 128
-    N_LAYER = 2
+    N_LAYER = 4  # was split across n_layer/n_blocks; one knob now
     N_HEAD = 4
     N_EMBD = 128
-    N_BLOCKS = 4
     LEARNING_RATE = 1e-3
     STEPS = 5001
     EVAL_INTERVAL = 100
     MAX_NEW_TOKENS = 300
+
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
 
     corpus = Corpus()
     model = GPT(
@@ -283,20 +314,21 @@ if __name__ == "__main__":
         n_layer=N_LAYER,
         n_head=N_HEAD,
         n_embd=N_EMBD,
-        n_blocks=N_BLOCKS,
-    )
-    print(f"{sum(p.numel() for p in model.parameters()):,} params")
+    ).to(device)
+    print(f"{sum(p.numel() for p in model.parameters()):,} params on {device}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     for step in range(STEPS):
-        x, y = corpus.get_batch("train", batch_size=BATCH_SIZE, block_size=BLOCK_SIZE)
+        x, y = corpus.get_batch(
+            "train", batch_size=BATCH_SIZE, block_size=BLOCK_SIZE, device=device
+        )
         _, loss = model(x, y)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         if step % EVAL_INTERVAL == 0:
             xv, yv = corpus.get_batch(
-                "val", batch_size=BATCH_SIZE, block_size=BLOCK_SIZE
+                "val", batch_size=BATCH_SIZE, block_size=BLOCK_SIZE, device=device
             )
             with torch.no_grad():
                 _, val_loss = model(xv, yv)
@@ -305,7 +337,9 @@ if __name__ == "__main__":
             )
 
     print("--- sample ---")
-    prompt = torch.zeros((1, 1), dtype=torch.long)  # id 0 = '\n' in sorted vocab
+    prompt = torch.zeros(
+        (1, 1), dtype=torch.long, device=device
+    )  # id 0 = '\n' in sorted vocab
     print(
         corpus.decode(model.generate(prompt, max_new_tokens=MAX_NEW_TOKENS)[0].tolist())
     )
