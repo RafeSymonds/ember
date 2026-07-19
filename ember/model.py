@@ -22,9 +22,11 @@ timebox). nanoGPT source is for diffing AFTER yours trains, never before.
 # Your code here.
 
 import torch
-from torch import nn
+from torch import blackman_window, embedding, ne, nn
 
 from torch.nn import functional as F
+
+DROPOUT = 0.2
 
 
 class Head(nn.Module):
@@ -38,6 +40,8 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size)
 
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+
+        self.dropout = nn.Dropout(DROPOUT)
 
     def forward(self, x):
         # x: (B, T, C)   B sequences, T positions, C = n_embd channels each
@@ -58,6 +62,8 @@ class Head(nn.Module):
         # normalize each row i over its allowed keys j <= i: rows now sum to 1
         wei = F.softmax(wei, dim=-1)
 
+        wei = self.dropout(wei)
+
         V = self.value(x)  # (B, T, head_size)  what each position actually broadcasts
         # each position's output = weighted average of the values it attends to:
         # (B, T, T) @ (B, T, hs) -> (B, T, head_size)
@@ -77,9 +83,48 @@ class MultiHead(nn.Module):
         self.heads = nn.ModuleList(
             Head(n_embd, head_size, block_size) for _ in range(n_head)
         )
+        self.dropout = nn.Dropout(DROPOUT)
 
     def forward(self, x):
-        return torch.cat(list(head(x) for head in self.heads), dim=-1)
+        out = torch.cat(list(head(x) for head in self.heads), dim=-1)
+        out = self.dropout(out)
+
+        return out
+
+
+class FeedFoward(nn.Module):
+    def __init__(self, n_embd: int) -> None:
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(DROPOUT),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+    def __init__(
+        self, n_embd: int, n_head: int, head_size: int, block_size: int
+    ) -> None:
+        super().__init__()
+
+        self.sa = MultiHead(
+            n_head=n_head, n_embd=n_embd, head_size=head_size, block_size=block_size
+        )
+        self.ffwd = FeedFoward(n_embd=n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+
+        return x
 
 
 class GPT(nn.Module):
@@ -118,6 +163,7 @@ class GPT(nn.Module):
         n_layer: int,
         n_head: int,
         n_embd: int,
+        n_blocks: int,
     ) -> None:
         super().__init__()
 
@@ -127,16 +173,27 @@ class GPT(nn.Module):
         self.n_head = n_head
         self.n_embd = n_embd
 
+        head_size = n_embd // n_head
+
         self.token_embedding_layer = nn.Embedding(vocab_size, n_embd)
         # one row per position slot, so the table is block_size deep
         self.position_embedding_layer = nn.Embedding(block_size, n_embd)
         # rung (b): one full-width head; rung (c) splits into n_head of n_embd // n_head
-        self.sa_head = MultiHead(
-            n_head=n_head,
-            n_embd=n_embd,
-            head_size=n_embd // n_head,
-            block_size=block_size,
+
+        self.blocks = nn.Sequential(
+            *list(
+                (
+                    Block(
+                        n_head=n_head,
+                        n_embd=n_embd,
+                        head_size=head_size,
+                        block_size=block_size,
+                    )
+                )
+                for _ in range(n_blocks)
+            )
         )
+
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -159,7 +216,7 @@ class GPT(nn.Module):
         # (B, T, C) + (T, C): broadcasting copies the position rows across B.
         # after this, a token's vector encodes WHAT it is and WHERE it sits.
         x = token_embedding + pos_embedding
-        x = self.sa_head(x)  # (B, T, C) -> (B, T, C), contents now context-mixed
+        x = self.blocks(x)  # (B, T, C) -> (B, T, C), contents now context-mixed
 
         # the only exit from model-space: (B, T, C) -> (B, T, vocab_size)
         logits = self.lm_head(x)
@@ -206,25 +263,41 @@ if __name__ == "__main__":
     # tokens->logits function; wiring to data happens only at the edges.
     from ember.data import Corpus
 
+    torch.manual_seed(1337)
+
+    BATCH_SIZE = 64
+    BLOCK_SIZE = 128
+    N_LAYER = 2
+    N_HEAD = 4
+    N_EMBD = 128
+    N_BLOCKS = 4
+    LEARNING_RATE = 1e-3
+    STEPS = 5001
+    EVAL_INTERVAL = 100
+    MAX_NEW_TOKENS = 300
+
     corpus = Corpus()
     model = GPT(
         vocab_size=corpus.vocab_size,
-        block_size=64,
-        n_layer=2,
-        n_head=2,
-        n_embd=64,
+        block_size=BLOCK_SIZE,
+        n_layer=N_LAYER,
+        n_head=N_HEAD,
+        n_embd=N_EMBD,
+        n_blocks=N_BLOCKS,
     )
     print(f"{sum(p.numel() for p in model.parameters()):,} params")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    for step in range(2001):
-        x, y = corpus.get_batch("train", batch_size=32, block_size=64)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    for step in range(STEPS):
+        x, y = corpus.get_batch("train", batch_size=BATCH_SIZE, block_size=BLOCK_SIZE)
         _, loss = model(x, y)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        if step % 100 == 0:
-            xv, yv = corpus.get_batch("val", batch_size=32, block_size=64)
+        if step % EVAL_INTERVAL == 0:
+            xv, yv = corpus.get_batch(
+                "val", batch_size=BATCH_SIZE, block_size=BLOCK_SIZE
+            )
             with torch.no_grad():
                 _, val_loss = model(xv, yv)
             print(
@@ -233,4 +306,6 @@ if __name__ == "__main__":
 
     print("--- sample ---")
     prompt = torch.zeros((1, 1), dtype=torch.long)  # id 0 = '\n' in sorted vocab
-    print(corpus.decode(model.generate(prompt, max_new_tokens=300)[0].tolist()))
+    print(
+        corpus.decode(model.generate(prompt, max_new_tokens=MAX_NEW_TOKENS)[0].tolist())
+    )
