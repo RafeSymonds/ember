@@ -11,4 +11,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]" --extra-index-url https://download.pytorch.org/whl/cpu
+      - run: python tools/get_data.py
       - run: python -m pytest tests/ -q
